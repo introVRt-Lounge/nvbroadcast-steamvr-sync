@@ -9,6 +9,10 @@ global BROADCAST_UI_PATH := "C:\Program Files\NVIDIA Corporation\NVIDIA Broadcas
 global BROADCAST_VERSION_OK := true
 global TRAY_STATUS_ITEM := "Status: Starting..."
 global FIRST_RUN := !FileExist(CONFIG_FILE)
+; Cached SoundVolumeView dump - NEVER spawn powershell/cmd on the hot path (elevated consoles flash).
+global SVV_CACHE_TEXT := ""
+global SVV_CACHE_TICK := 0
+global SVV_CACHE_MS := 2500
 if FIRST_RUN {
     SaveConfig(APP_CONFIG)
 }
@@ -19,44 +23,87 @@ if FIRST_RUN {
     SetTimer(ShowFirstRunOnboarding, -600)
 }
 
-ResolveDeviceId(partialName, direction := "Render", requireActive := false) {
+NormalizeDeviceLabel(name) {
+    trimmed := Trim(name)
+    if (trimmed = "") {
+        return trimmed
+    }
+    return RegExReplace(trimmed, "^\d+\s*-\s*")
+}
+
+RefreshSvvCache(force := false) {
+    global SVV_CACHE_TEXT, SVV_CACHE_TICK, SVV_CACHE_MS
+    now := A_TickCount
+    if (!force && SVV_CACHE_TEXT != "" && (now - SVV_CACHE_TICK) < SVV_CACHE_MS) {
+        return true
+    }
     svvPath := A_ScriptDir "\SoundVolumeView.exe"
     if !FileExist(svvPath) {
+        SVV_CACHE_TEXT := ""
+        return false
+    }
+    ; Tab-delimited dump is AHK-friendly and needs no PowerShell parsing.
+    tabPath := A_Temp "\svv-devices.tsv"
+    try {
+        RunWait(Format('"{}" /stab "{}" /Columns "{}"', svvPath, tabPath, "Name,Device Name,Command-Line Friendly ID,Direction,Type,Device State"),, "Hide")
+        SVV_CACHE_TEXT := FileRead(tabPath)
+        SVV_CACHE_TICK := A_TickCount
+        return true
+    } catch Error as err {
+        SVV_CACHE_TEXT := ""
+        return false
+    }
+}
+
+ResolveDeviceId(partialName, direction := "Render", requireActive := false) {
+    if !RefreshSvvCache() {
         return ""
     }
-
-    escapedTerm := StrReplace(partialName, "'", "''")
-    escapedSvvPath := StrReplace(svvPath, "'", "''")
-    csvPath := A_Temp "\svv-devices.csv"
-    escapedCsvPath := StrReplace(csvPath, "'", "''")
-    escapedDirection := StrReplace(direction, "'", "''")
-    activeFilter := requireActive ? " -and $_.'Device State' -eq 'Active'" : ""
-    psCommand := "$svv = '" escapedSvvPath "'; " .
-        "$csv = '" escapedCsvPath "'; " .
-        "& $svv /scomma $csv /Columns 'Name,Device Name,Command-Line Friendly ID,Direction,Type,Device State'; " .
-        "$rows = Import-Csv -Path $csv -ErrorAction SilentlyContinue; " .
-        "$term = '" escapedTerm "'; " .
-        "$dir = '" escapedDirection "'; " .
-        "$match = $rows | Where-Object { " .
-        "$normName = ($_.'Name' -replace '^\d+\s*-\s*',''); " .
-        "$normDeviceName = ($_.'Device Name' -replace '^\d+\s*-\s*',''); " .
-        "$normId = ($_.'Command-Line Friendly ID' -replace '^\d+\s*-\s*',''); " .
-        "$_.'Type' -eq 'Device' -and $_.'Direction' -eq $dir" activeFilter " -and (" .
-        "$_.'Name' -like ('*' + $term + '*') -or " .
-        "$_.'Device Name' -like ('*' + $term + '*') -or " .
-        "$_.'Command-Line Friendly ID' -like ('*' + $term + '*') -or " .
-        "$normName -like ('*' + $term + '*') -or " .
-        "$normDeviceName -like ('*' + $term + '*') -or " .
-        "$normId -like ('*' + $term + '*')" .
-        ") } | Sort-Object @{Expression={ if($_.'Device State' -eq 'Active'){0}else{1} }}, Name | Select-Object -First 1; " .
-        "if ($match) { $match.'Command-Line Friendly ID' }"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    deviceId := Trim(exec.StdOut.ReadAll(), "`r`n`t ")
-    return deviceId
+    global SVV_CACHE_TEXT
+    term := NormalizeDeviceLabel(partialName)
+    if (term = "") {
+        return ""
+    }
+    bestId := ""
+    bestActive := false
+    for _, line in StrSplit(SVV_CACHE_TEXT, "`n", "`r") {
+        if (line = "" || InStr(line, "Name`tDevice Name`t") = 1 || InStr(line, "Name	Device Name	") = 1) {
+            continue
+        }
+        cols := StrSplit(line, "`t")
+        if (cols.Length < 6) {
+            continue
+        }
+        itemName := cols[1]
+        deviceName := cols[2]
+        deviceId := cols[3]
+        itemDirection := cols[4]
+        itemType := cols[5]
+        itemState := cols[6]
+        if (itemType != "Device" || itemDirection != direction) {
+            continue
+        }
+        hay := NormalizeDeviceLabel(itemName) " " NormalizeDeviceLabel(deviceName) " " NormalizeDeviceLabel(deviceId)
+        if !InStr(hay, term) {
+            continue
+        }
+        isActive := (itemState = "Active")
+        if (requireActive && !isActive) {
+            continue
+        }
+        if (bestId = "" || (isActive && !bestActive)) {
+            bestId := deviceId
+            bestActive := isActive
+            if (isActive) {
+                break
+            }
+        }
+    }
+    return bestId
 }
 
 ResolveDeviceIdFromAliases(aliases, direction := "Render", requireActive := false) {
+    RefreshSvvCache()
     for _, alias in aliases {
         id := ResolveDeviceId(alias, direction, requireActive)
         if (id != "") {
@@ -195,20 +242,32 @@ IsVirtualDesktopSessionActive() {
 }
 
 HasVirtualDesktopLanSession() {
-    psCommand :=
-    (
-        "$p = Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue | Select-Object -First 1;"
-        "if (-not $p) { '0'; exit };"
-        "$hits = Get-NetTCPConnection -OwningProcess $p.Id -State Established -ErrorAction SilentlyContinue |"
-        " Where-Object {"
-        "  $_.LocalPort -in 38810,38820,38830,38840 -and"
-        "  $_.RemoteAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|::1|fc|fd|fe80)'"
-        " };"
-        "if ($hits) { '1' } else { '0' }"
-    )
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    return Trim(exec.StdOut.ReadAll(), "`r`n`t ") = "1"
+    ; Fallback only when SoundVolumeView is missing. Prefer netstat file dump - no visible console.
+    if !ProcessExist("VirtualDesktop.Streamer.exe") {
+        return false
+    }
+    outFile := A_Temp "\vd-netstat.txt"
+    try {
+        RunWait(Format('{} /c netstat -ano > "{}"', A_ComSpec, outFile),, "Hide")
+        text := FileRead(outFile)
+    } catch Error as err {
+        return false
+    }
+    streamerPid := ProcessExist("VirtualDesktop.Streamer.exe")
+    pidToken := " " streamerPid
+    for _, line in StrSplit(text, "`n", "`r") {
+        if !InStr(line, "ESTABLISHED") || !InStr(line, pidToken) {
+            continue
+        }
+        if !(InStr(line, ":38810") || InStr(line, ":38820") || InStr(line, ":38830") || InStr(line, ":38840")) {
+            continue
+        }
+        ; Private / LAN peers only - skip public cloud signaling IPs.
+        if RegExMatch(line, "\s(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|127\.\d+\.\d+\.\d+):") {
+            return true
+        }
+    }
+    return false
 }
 
 DetectAudioMode() {
@@ -274,23 +333,41 @@ IsBroadcastVersionSupported(version) {
 }
 
 GetInstalledNvidiaBroadcastVersion() {
-    psCommand := "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | " .
-        "Where-Object { $_.DisplayName -like 'NVIDIA Broadcast *' -and $_.DisplayVersion } | " .
-        "Sort-Object DisplayVersion -Descending | Select-Object -First 1 -ExpandProperty DisplayVersion)"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    return Trim(exec.StdOut.ReadAll(), "`r`n`t ")
+    ; Registry walk in-process - no powershell/cmd windows.
+    roots := [
+        "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    ]
+    best := ""
+    for _, root in roots {
+        try {
+            loop reg root, "K" {
+                try {
+                    name := RegRead(root "\" A_LoopRegName, "DisplayName")
+                    ver := RegRead(root "\" A_LoopRegName, "DisplayVersion")
+                    if InStr(name, "NVIDIA Broadcast") && ver != "" {
+                        if (best = "" || StrCompare(ver, best) > 0) {
+                            best := ver
+                        }
+                    }
+                } catch Error as err {
+                }
+            }
+        } catch Error as err {
+        }
+    }
+    return best
 }
 
 GetBroadcastProductVersionFromFile(filePath) {
     if !FileExist(filePath) {
         return ""
     }
-    escapedPath := StrReplace(filePath, "'", "''")
-    psCommand := "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo('" escapedPath "'); $v.ProductVersion"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    return Trim(exec.StdOut.ReadAll(), "`r`n`t ")
+    try {
+        return FileGetVersion(filePath)
+    } catch Error as err {
+        return ""
+    }
 }
 
 ShowConfigGui(*) {
@@ -478,14 +555,6 @@ FilterDeviceList(items, containsText) {
     return filtered
 }
 
-NormalizeDeviceLabel(name) {
-    trimmed := Trim(name)
-    if (trimmed = "") {
-        return trimmed
-    }
-    return RegExReplace(trimmed, "^\d+\s*-\s*")
-}
-
 SetDropDownSelectionByContains(dropdown, items, needle) {
     match := Trim(needle)
     if (match = "") {
@@ -557,26 +626,43 @@ SaveConfigFromGui(cfgGui, captureEdit, vrRenderEdit, vdRenderEdit, desktopRender
     MsgBox "Saved config to:`n" CONFIG_FILE
 }
 
-ResolveAudioDeviceName(partialName) {
-    escaped := StrReplace(partialName, "'", "''")
-    psCommand := "$term = '" escaped "'; " .
-        "(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render' -ErrorAction SilentlyContinue | " .
-        "ForEach-Object { " .
-        "$props = Get-ItemProperty -Path ($_.PSPath + '\Properties') -ErrorAction SilentlyContinue; " .
-        "$name = $props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},14'; " .
-        "if (-not $name) { $name = $props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},6' }; " .
-        "if (-not $name) { $name = $props.'{a45c254e-df1c-4efd-8020-67d146a850e0},2' }; " .
-        "$name " .
-        "}) | Where-Object { $_ -and $_ -like ('*' + $term + '*') } | Sort-Object -Unique | Select-Object -First 1"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    deviceName := Trim(exec.StdOut.ReadAll(), "`r`n`t ")
-    return deviceName
+ResolveAudioDeviceName(partialName, direction := "Render") {
+    if !RefreshSvvCache() {
+        return ""
+    }
+    global SVV_CACHE_TEXT
+    term := NormalizeDeviceLabel(partialName)
+    if (term = "") {
+        return ""
+    }
+    for _, line in StrSplit(SVV_CACHE_TEXT, "`n", "`r") {
+        if (line = "") {
+            continue
+        }
+        cols := StrSplit(line, "`t")
+        if (cols.Length < 6) {
+            continue
+        }
+        itemName := cols[1]
+        deviceName := cols[2]
+        deviceId := cols[3]
+        itemDirection := cols[4]
+        itemType := cols[5]
+        if (itemType != "Device" || itemDirection != direction) {
+            continue
+        }
+        hay := NormalizeDeviceLabel(itemName) " " NormalizeDeviceLabel(deviceName) " " NormalizeDeviceLabel(deviceId)
+        if InStr(hay, term) {
+            label := NormalizeDeviceLabel(deviceName)
+            return (label != "") ? label : NormalizeDeviceLabel(itemName)
+        }
+    }
+    return ""
 }
 
-ResolveAudioDeviceNameFromAliases(aliases) {
+ResolveAudioDeviceNameFromAliases(aliases, direction := "Render") {
     for _, alias in aliases {
-        name := ResolveAudioDeviceName(alias)
+        name := ResolveAudioDeviceName(alias, direction)
         if (name != "") {
             return name
         }
@@ -624,7 +710,7 @@ SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch 
             }
         }
         if (isArray) {
-            resolvedName := ResolveAudioDeviceNameFromAliases(deviceNameOrPartial)
+            resolvedName := ResolveAudioDeviceNameFromAliases(deviceNameOrPartial, direction)
             missingName := ""
             for index, alias in deviceNameOrPartial {
                 if (index > 1) {
@@ -633,7 +719,7 @@ SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch 
                 missingName .= alias
             }
         } else {
-            resolvedName := ResolveAudioDeviceName(deviceNameOrPartial)
+            resolvedName := ResolveAudioDeviceName(deviceNameOrPartial, direction)
             missingName := deviceNameOrPartial
         }
         if (deviceId = "" && resolvedName = "") {
@@ -759,10 +845,8 @@ MonitorAudioModes() {
             ApplyAudioProfile(mode)
             UpdateTrayForMode(mode, true)
             lastMode := mode
-        } else {
-            UpdateTrayForMode(mode)
         }
-        Sleep(1000)
+        Sleep(2000)
     }
 }
 
