@@ -225,47 +225,50 @@ ShowFirstRunOnboarding() {
 }
 
 ; Active headset session, not "Streamer.exe exists".
-; Primary signal: Virtual Desktop Audio Render endpoint is Active in SoundVolumeView.
-; (Capture stays Active while Streamer idles; Render does not.)
-; Fallback: Streamer has ESTABLISHED TCP to a private/LAN peer on VD ports (excludes cloud signaling).
+; Hot path MUST NOT Run/RunWait anything - elevated consoles flash every poll.
+; Signal: MMDevices Render "Virtual Desktop Audio" DeviceState is exactly 1 (DEVICE_STATE_ACTIVE).
+; Idle Streamer leaves it at 0x10000001 (Active bit set + high flag) which SoundVolumeView
+; treats as non-Active - we mirror that by requiring State == 1.
 IsVirtualDesktopSessionActive() {
     global APP_CONFIG
-    svvPath := A_ScriptDir "\SoundVolumeView.exe"
-    if FileExist(svvPath) {
-        if IsDeviceActiveByAliases(APP_CONFIG.VdRenderAliases, "Render") {
+    for _, alias in APP_CONFIG.VdRenderAliases {
+        if IsMmDeviceExactlyActive(alias, "Render") {
             return true
         }
-        ; If SVV is present, trust it over process/port heuristics when Render is inactive.
-        return false
     }
-    return HasVirtualDesktopLanSession()
+    return false
 }
 
-HasVirtualDesktopLanSession() {
-    ; Fallback only when SoundVolumeView is missing. Prefer netstat file dump - no visible console.
-    if !ProcessExist("VirtualDesktop.Streamer.exe") {
+IsMmDeviceExactlyActive(alias, direction := "Render") {
+    needle := NormalizeDeviceLabel(alias)
+    if (needle = "") {
         return false
     }
-    outFile := A_Temp "\vd-netstat.txt"
+    root := (direction = "Capture")
+        ? "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+        : "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
     try {
-        RunWait(Format('{} /c netstat -ano > "{}"', A_ComSpec, outFile),, "Hide")
-        text := FileRead(outFile)
+        loop reg root, "K" {
+            key := root "\" A_LoopRegName
+            try {
+                state := RegRead(key, "DeviceState")
+            } catch Error as err {
+                continue
+            }
+            ; Exact ACTIVE only. 0x10000001 and friends are "listed but not live".
+            if (Integer(state) != 1) {
+                continue
+            }
+            desc := ""
+            name := ""
+            try desc := RegRead(key "\Properties", "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+            try name := RegRead(key "\Properties", "{a45c254e-df1c-4efd-8020-67d146a850e0},2")
+            hay := NormalizeDeviceLabel(desc) " " NormalizeDeviceLabel(name)
+            if InStr(hay, needle) {
+                return true
+            }
+        }
     } catch Error as err {
-        return false
-    }
-    streamerPid := ProcessExist("VirtualDesktop.Streamer.exe")
-    pidToken := " " streamerPid
-    for _, line in StrSplit(text, "`n", "`r") {
-        if !InStr(line, "ESTABLISHED") || !InStr(line, pidToken) {
-            continue
-        }
-        if !(InStr(line, ":38810") || InStr(line, ":38820") || InStr(line, ":38830") || InStr(line, ":38840")) {
-            continue
-        }
-        ; Private / LAN peers only - skip public cloud signaling IPs.
-        if RegExMatch(line, "\s(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|127\.\d+\.\d+\.\d+):") {
-            return true
-        }
     }
     return false
 }
@@ -846,7 +849,8 @@ MonitorAudioModes() {
             UpdateTrayForMode(mode, true)
             lastMode := mode
         }
-        Sleep(2000)
+        ; Registry-only detect on this interval - never launch helpers here.
+        Sleep(3000)
     }
 }
 
