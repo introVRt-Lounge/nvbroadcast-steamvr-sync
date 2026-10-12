@@ -1,6 +1,6 @@
 # SteamVR + NVIDIA Broadcast mic source sync
 
-AutoHotkey v2 script: `autoswitch mic for VR.ahk`. It watches SteamVR and keeps **NVIDIA Broadcast v1**'s **microphone source dropdown** aligned with VR vs desktop use, while also setting Windows default and communications devices where needed (for example Discord splitting default vs comms).
+AutoHotkey v2 script: `autoswitch mic for VR.ahk`. It watches **active Virtual Desktop sessions**, SteamVR, and desktop idle state, and keeps **NVIDIA Broadcast v1**'s **microphone source dropdown** aligned with the current mode, while also setting Windows default and communications devices where needed (for example Discord splitting default vs comms).
 
 **Repository:** [introVRt-Lounge/nvbroadcast-steamvr-sync](https://github.com/introVRt-Lounge/nvbroadcast-steamvr-sync) (default branch `main`)
 
@@ -10,7 +10,7 @@ AutoHotkey v2 script: `autoswitch mic for VR.ahk`. It watches SteamVR and keeps 
 - **Generic "audio switcher" tools** are everywhere. They are great at flipping Windows endpoints. They do not reliably drive **Broadcast's own UI state** - specifically the **mic source** list inside Broadcast.
 - **NVIDIA Broadcast is the awkward piece**: it sits between physical mics and apps. When you enter or leave VR, you often need Broadcast to point at a different physical input. Broadcast does not follow SteamVR the way endpoints do, so you end up with **Broadcast and Windows disagreeing** unless something updates Broadcast explicitly.
 
-This tool exists to automate **that Broadcast integration**, with SteamVR start/stop as the trigger, plus the Windows default/comms tweaks that tend to matter for real sessions (especially comms routing).
+This tool exists to automate **that Broadcast integration**, with Virtual Desktop active-session detection and SteamVR start/stop as triggers, plus the Windows default/comms tweaks that tend to matter for real sessions (especially comms routing).
 
 ## Requirements
 
@@ -66,16 +66,28 @@ Windows separates "default device" and "default communications device." Many app
 
 ## Example behavior (defaults in this project)
 
-When SteamVR starts:
+Priority each second:
+
+1. **Active Virtual Desktop session** (highest)
+2. **SteamVR** (`vrmonitor.exe`)
+3. **Desktop**
+
+Active Virtual Desktop session:
+
+- Windows default input and comms input -> `NVIDIA Broadcast`
+- NVIDIA Broadcast mic source -> item containing `Virtual Desktop`
+- Windows default output and comms output -> `Virtual Desktop Audio`
+
+SteamVR (and no active VD session):
 
 - Windows default input and comms input -> `NVIDIA Broadcast`
 - NVIDIA Broadcast mic source -> item containing `Beyond`
 - Windows default output and comms output -> Beyond strap device (matched by aliases)
 
-When SteamVR stops:
+Desktop (neither above):
 
 - Windows default input and comms input remain -> `NVIDIA Broadcast`
-- NVIDIA Broadcast mic source -> item containing `USB audio CODEC`
+- NVIDIA Broadcast mic source -> item containing `Jabra`
 - Windows default output and comms output -> `SteelSeries Arctis 1 Wireless`
 
 Your machine will differ - configure via the UI and INI.
@@ -86,18 +98,20 @@ You can configure this without touching code:
 
 1. Right-click the tray icon for `autoswitch mic for VR.exe`
 2. Click `Configure VR Audio Targets...`
-3. In the main screen, use the left `Audio in VR` panel and right `Audio on Desktop` panel to pick:
-   - Input
-   - Output
+3. In the main screen, pick Input/Output for each of the three profiles:
+   - SteamVR / Beyond
+   - Virtual Desktop (active session)
+   - Desktop
 4. Save
 
 Use `Advanced...` only if you want alias-level tuning and fallback patterns.
 
 Advanced mode is grouped by:
 
-- `In VR`
-- `On Desktop`
 - Shared NVIDIA Broadcast input defaults
+- SteamVR / Beyond
+- Virtual Desktop (active session)
+- On Desktop
 
 Settings are stored in `autoswitch mic for VR.ini` next to the script/exe.
 
@@ -107,14 +121,17 @@ Alias fields support pipe-delimited fallback values, for example:
 
 - `Beyond|YondBe|Strap`
 - `SteelSeries Arctis 1 Wireless|Arctis 1 Wireless|SteelSeries`
+- `Virtual Desktop Audio|Virtual Desktop`
 
-## Virtual Desktop stand-down
+## Virtual Desktop: active session, not "Streamer running"
 
-If Virtual Desktop is running, this tool intentionally stands down and does not change audio routing.
+Virtual Desktop Streamer often stays resident in the tray. This tool does **not** stand down just because Streamer.exe exists.
 
-- Tray status changes to stand-down mode
-- Config windows show a loud warning that the tool is not active
-- This avoids fighting Virtual Desktop, which already manages VR audio paths
+An **active** session is detected primarily when SoundVolumeView reports the `Virtual Desktop Audio` **Render** endpoint as **Active**. That render device is absent/inactive while Streamer is idle; the matching Capture device often stays Active either way, so Capture alone is a bad signal.
+
+If SoundVolumeView is missing, a fallback checks for ESTABLISHED TCP from Streamer to a private/LAN peer on VD ports (38810/38820/38830/38840), ignoring cloud signaling peers.
+
+When a VD session is active, this tool drives NVIDIA Broadcast the same way it does for Beyond - it does not require VoiceMeeter.
 
 ## Tooling
 

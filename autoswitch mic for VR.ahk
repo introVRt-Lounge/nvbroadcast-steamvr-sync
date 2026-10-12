@@ -2,14 +2,17 @@
 
 global CONFIG_FILE := A_ScriptDir "\autoswitch mic for VR.ini"
 global APP_CONFIG := LoadConfig()
-; Do NOT key off VirtualDesktop.Service.exe because it can run persistently as a service
-; even when user is not actively using Virtual Desktop for VR streaming.
-global VD_PROCESS_NAMES := ["VirtualDesktop.Streamer.exe", "VirtualDesktop.Server.exe"]
-global IS_STANDDOWN := false
+; Modes: "virtualdesktop" | "steamvr" | "desktop"
+; Do NOT treat VirtualDesktop.Streamer.exe / Service.exe as "active" - Streamer often idles in the tray.
+global CURRENT_MODE := ""
 global BROADCAST_UI_PATH := "C:\Program Files\NVIDIA Corporation\NVIDIA Broadcast\NVIDIA Broadcast UI.exe"
 global BROADCAST_VERSION_OK := true
-global TRAY_STATUS_ITEM := "Status: Active"
+global TRAY_STATUS_ITEM := "Status: Starting..."
 global FIRST_RUN := !FileExist(CONFIG_FILE)
+; Cached SoundVolumeView dump - NEVER spawn powershell/cmd on the hot path (elevated consoles flash).
+global SVV_CACHE_TEXT := ""
+global SVV_CACHE_TICK := 0
+global SVV_CACHE_MS := 2500
 if FIRST_RUN {
     SaveConfig(APP_CONFIG)
 }
@@ -20,45 +23,89 @@ if FIRST_RUN {
     SetTimer(ShowFirstRunOnboarding, -600)
 }
 
-ResolveDeviceId(partialName, direction := "Render") {
-    svvPath := A_ScriptDir "\SoundVolumeView.exe"
-    if !FileExist(svvPath) {
-        return ""
+NormalizeDeviceLabel(name) {
+    trimmed := Trim(name)
+    if (trimmed = "") {
+        return trimmed
     }
-
-    escapedTerm := StrReplace(partialName, "'", "''")
-    escapedSvvPath := StrReplace(svvPath, "'", "''")
-    csvPath := A_Temp "\svv-devices.csv"
-    escapedCsvPath := StrReplace(csvPath, "'", "''")
-    escapedDirection := StrReplace(direction, "'", "''")
-    psCommand := "$svv = '" escapedSvvPath "'; " .
-        "$csv = '" escapedCsvPath "'; " .
-        "& $svv /scomma $csv /Columns 'Name,Device Name,Command-Line Friendly ID,Direction,Type,Device State'; " .
-        "$rows = Import-Csv -Path $csv -ErrorAction SilentlyContinue; " .
-        "$term = '" escapedTerm "'; " .
-        "$dir = '" escapedDirection "'; " .
-        "$match = $rows | Where-Object { " .
-        "$normName = ($_.'Name' -replace '^\d+\s*-\s*',''); " .
-        "$normDeviceName = ($_.'Device Name' -replace '^\d+\s*-\s*',''); " .
-        "$normId = ($_.'Command-Line Friendly ID' -replace '^\d+\s*-\s*',''); " .
-        "$_.'Type' -eq 'Device' -and $_.'Direction' -eq $dir -and (" .
-        "$_.'Name' -like ('*' + $term + '*') -or " .
-        "$_.'Device Name' -like ('*' + $term + '*') -or " .
-        "$_.'Command-Line Friendly ID' -like ('*' + $term + '*') -or " .
-        "$normName -like ('*' + $term + '*') -or " .
-        "$normDeviceName -like ('*' + $term + '*') -or " .
-        "$normId -like ('*' + $term + '*')" .
-        ") } | Sort-Object @{Expression={ if($_.'Device State' -eq 'Active'){0}else{1} }}, Name | Select-Object -First 1; " .
-        "if ($match) { $match.'Command-Line Friendly ID' }"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    deviceId := Trim(exec.StdOut.ReadAll(), "`r`n`t ")
-    return deviceId
+    return RegExReplace(trimmed, "^\d+\s*-\s*")
 }
 
-ResolveDeviceIdFromAliases(aliases, direction := "Render") {
+RefreshSvvCache(force := false) {
+    global SVV_CACHE_TEXT, SVV_CACHE_TICK, SVV_CACHE_MS
+    now := A_TickCount
+    if (!force && SVV_CACHE_TEXT != "" && (now - SVV_CACHE_TICK) < SVV_CACHE_MS) {
+        return true
+    }
+    svvPath := A_ScriptDir "\SoundVolumeView.exe"
+    if !FileExist(svvPath) {
+        SVV_CACHE_TEXT := ""
+        return false
+    }
+    ; Tab-delimited dump is AHK-friendly and needs no PowerShell parsing.
+    tabPath := A_Temp "\svv-devices.tsv"
+    try {
+        RunWait(Format('"{}" /stab "{}" /Columns "{}"', svvPath, tabPath, "Name,Device Name,Command-Line Friendly ID,Direction,Type,Device State"),, "Hide")
+        SVV_CACHE_TEXT := FileRead(tabPath)
+        SVV_CACHE_TICK := A_TickCount
+        return true
+    } catch Error as err {
+        SVV_CACHE_TEXT := ""
+        return false
+    }
+}
+
+ResolveDeviceId(partialName, direction := "Render", requireActive := false) {
+    if !RefreshSvvCache() {
+        return ""
+    }
+    global SVV_CACHE_TEXT
+    term := NormalizeDeviceLabel(partialName)
+    if (term = "") {
+        return ""
+    }
+    bestId := ""
+    bestActive := false
+    for _, line in StrSplit(SVV_CACHE_TEXT, "`n", "`r") {
+        if (line = "" || InStr(line, "Name`tDevice Name`t") = 1 || InStr(line, "Name	Device Name	") = 1) {
+            continue
+        }
+        cols := StrSplit(line, "`t")
+        if (cols.Length < 6) {
+            continue
+        }
+        itemName := cols[1]
+        deviceName := cols[2]
+        deviceId := cols[3]
+        itemDirection := cols[4]
+        itemType := cols[5]
+        itemState := cols[6]
+        if (itemType != "Device" || itemDirection != direction) {
+            continue
+        }
+        hay := NormalizeDeviceLabel(itemName) " " NormalizeDeviceLabel(deviceName) " " NormalizeDeviceLabel(deviceId)
+        if !InStr(hay, term) {
+            continue
+        }
+        isActive := (itemState = "Active")
+        if (requireActive && !isActive) {
+            continue
+        }
+        if (bestId = "" || (isActive && !bestActive)) {
+            bestId := deviceId
+            bestActive := isActive
+            if (isActive) {
+                break
+            }
+        }
+    }
+    return bestId
+}
+
+ResolveDeviceIdFromAliases(aliases, direction := "Render", requireActive := false) {
+    RefreshSvvCache()
     for _, alias in aliases {
-        id := ResolveDeviceId(alias, direction)
+        id := ResolveDeviceId(alias, direction, requireActive)
         if (id != "") {
             return id
         }
@@ -66,21 +113,29 @@ ResolveDeviceIdFromAliases(aliases, direction := "Render") {
     return ""
 }
 
+IsDeviceActiveByAliases(aliases, direction := "Render") {
+    return ResolveDeviceIdFromAliases(aliases, direction, true) != ""
+}
+
 LoadConfig() {
     cfg := {}
     cfg.CaptureAliases := ParseAliasList(IniRead(CONFIG_FILE, "Devices", "CaptureAliases", "NVIDIA Broadcast|Broadcast"))
     cfg.VrRenderAliases := ParseAliasList(IniRead(CONFIG_FILE, "Devices", "VrRenderAliases", "Beyond|YondBe|Strap"))
+    cfg.VdRenderAliases := ParseAliasList(IniRead(CONFIG_FILE, "Devices", "VdRenderAliases", "Virtual Desktop Audio|Virtual Desktop"))
     cfg.DesktopRenderAliases := ParseAliasList(IniRead(CONFIG_FILE, "Devices", "DesktopRenderAliases", "SteelSeries Arctis 1 Wireless|Arctis 1 Wireless|SteelSeries"))
     cfg.BroadcastVrMicSource := IniRead(CONFIG_FILE, "Broadcast", "VrMicSourceContains", "Beyond")
-    cfg.BroadcastDesktopMicSource := IniRead(CONFIG_FILE, "Broadcast", "DesktopMicSourceContains", "USB audio CODEC")
+    cfg.BroadcastVdMicSource := IniRead(CONFIG_FILE, "Broadcast", "VdMicSourceContains", "Virtual Desktop")
+    cfg.BroadcastDesktopMicSource := IniRead(CONFIG_FILE, "Broadcast", "DesktopMicSourceContains", "Jabra")
     return cfg
 }
 
 SaveConfig(cfg) {
     IniWrite(JoinAliasList(cfg.CaptureAliases), CONFIG_FILE, "Devices", "CaptureAliases")
     IniWrite(JoinAliasList(cfg.VrRenderAliases), CONFIG_FILE, "Devices", "VrRenderAliases")
+    IniWrite(JoinAliasList(cfg.VdRenderAliases), CONFIG_FILE, "Devices", "VdRenderAliases")
     IniWrite(JoinAliasList(cfg.DesktopRenderAliases), CONFIG_FILE, "Devices", "DesktopRenderAliases")
     IniWrite(cfg.BroadcastVrMicSource, CONFIG_FILE, "Broadcast", "VrMicSourceContains")
+    IniWrite(cfg.BroadcastVdMicSource, CONFIG_FILE, "Broadcast", "VdMicSourceContains")
     IniWrite(cfg.BroadcastDesktopMicSource, CONFIG_FILE, "Broadcast", "DesktopMicSourceContains")
 }
 
@@ -154,7 +209,7 @@ InitializeTrayMenu() {
     A_TrayMenu.Add()
     A_TrayMenu.Add("Configure VR Audio Targets...", ShowConfigGui)
     A_TrayMenu.Add()
-    UpdateStandDownState(true)
+    UpdateTrayForMode(DetectAudioMode(), true)
 }
 
 TrayStatusNoop(*) {
@@ -169,38 +224,89 @@ ShowFirstRunOnboarding() {
     ShowConfigGui()
 }
 
-IsVirtualDesktopRunning() {
-    global VD_PROCESS_NAMES
-    for _, procName in VD_PROCESS_NAMES {
-        if ProcessExist(procName) {
+; Active headset session, not "Streamer.exe exists".
+; Hot path MUST NOT Run/RunWait anything - elevated consoles flash every poll.
+; Signal: MMDevices Render "Virtual Desktop Audio" DeviceState is exactly 1 (DEVICE_STATE_ACTIVE).
+; Idle Streamer leaves it at 0x10000001 (Active bit set + high flag) which SoundVolumeView
+; treats as non-Active - we mirror that by requiring State == 1.
+IsVirtualDesktopSessionActive() {
+    global APP_CONFIG
+    for _, alias in APP_CONFIG.VdRenderAliases {
+        if IsMmDeviceExactlyActive(alias, "Render") {
             return true
         }
     }
     return false
 }
 
-UpdateStandDownState(force := false) {
-    global IS_STANDDOWN, TRAY_STATUS_ITEM, BROADCAST_VERSION_OK
-    newState := IsVirtualDesktopRunning()
-    if (!force && newState = IS_STANDDOWN) {
+IsMmDeviceExactlyActive(alias, direction := "Render") {
+    needle := NormalizeDeviceLabel(alias)
+    if (needle = "") {
+        return false
+    }
+    root := (direction = "Capture")
+        ? "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+        : "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+    try {
+        loop reg root, "K" {
+            key := root "\" A_LoopRegName
+            try {
+                state := RegRead(key, "DeviceState")
+            } catch Error as err {
+                continue
+            }
+            ; Exact ACTIVE only. 0x10000001 and friends are "listed but not live".
+            if (Integer(state) != 1) {
+                continue
+            }
+            desc := ""
+            name := ""
+            try desc := RegRead(key "\Properties", "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+            try name := RegRead(key "\Properties", "{a45c254e-df1c-4efd-8020-67d146a850e0},2")
+            hay := NormalizeDeviceLabel(desc) " " NormalizeDeviceLabel(name)
+            if InStr(hay, needle) {
+                return true
+            }
+        }
+    } catch Error as err {
+    }
+    return false
+}
+
+DetectAudioMode() {
+    if IsVirtualDesktopSessionActive() {
+        return "virtualdesktop"
+    }
+    if ProcessExist("vrmonitor.exe") {
+        return "steamvr"
+    }
+    return "desktop"
+}
+
+UpdateTrayForMode(mode, force := false) {
+    global CURRENT_MODE, TRAY_STATUS_ITEM, BROADCAST_VERSION_OK
+    if (!force && mode = CURRENT_MODE) {
         return
     }
     oldLabel := TRAY_STATUS_ITEM
     if (!BROADCAST_VERSION_OK) {
         TRAY_STATUS_ITEM := "Status: Unsupported NVIDIA Broadcast version"
         A_IconTip := "VR Audio Auto-Switch - UNSUPPORTED: requires NVIDIA Broadcast 1.4.x"
-    } else if (newState) {
-        TRAY_STATUS_ITEM := "Status: Stand-down (Virtual Desktop is running)"
-        A_IconTip := "VR Audio Auto-Switch - STAND-DOWN (Virtual Desktop running)"
+    } else if (mode = "virtualdesktop") {
+        TRAY_STATUS_ITEM := "Status: Virtual Desktop (active session)"
+        A_IconTip := "VR Audio Auto-Switch - Virtual Desktop session active"
+    } else if (mode = "steamvr") {
+        TRAY_STATUS_ITEM := "Status: SteamVR (Beyond)"
+        A_IconTip := "VR Audio Auto-Switch - SteamVR / Beyond"
     } else {
-        TRAY_STATUS_ITEM := "Status: Active"
-        A_IconTip := "VR Audio Auto-Switch - Active"
+        TRAY_STATUS_ITEM := "Status: Desktop (Jabra)"
+        A_IconTip := "VR Audio Auto-Switch - Desktop / Jabra"
     }
     try {
         A_TrayMenu.Rename(oldLabel, TRAY_STATUS_ITEM)
         A_TrayMenu.Disable(TRAY_STATUS_ITEM)
     }
-    IS_STANDDOWN := newState
+    CURRENT_MODE := mode
 }
 
 CheckNvidiaBroadcastVersion() {
@@ -230,23 +336,41 @@ IsBroadcastVersionSupported(version) {
 }
 
 GetInstalledNvidiaBroadcastVersion() {
-    psCommand := "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | " .
-        "Where-Object { $_.DisplayName -like 'NVIDIA Broadcast *' -and $_.DisplayVersion } | " .
-        "Sort-Object DisplayVersion -Descending | Select-Object -First 1 -ExpandProperty DisplayVersion)"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    return Trim(exec.StdOut.ReadAll(), "`r`n`t ")
+    ; Registry walk in-process - no powershell/cmd windows.
+    roots := [
+        "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    ]
+    best := ""
+    for _, root in roots {
+        try {
+            loop reg root, "K" {
+                try {
+                    name := RegRead(root "\" A_LoopRegName, "DisplayName")
+                    ver := RegRead(root "\" A_LoopRegName, "DisplayVersion")
+                    if InStr(name, "NVIDIA Broadcast") && ver != "" {
+                        if (best = "" || StrCompare(ver, best) > 0) {
+                            best := ver
+                        }
+                    }
+                } catch Error as err {
+                }
+            }
+        } catch Error as err {
+        }
+    }
+    return best
 }
 
 GetBroadcastProductVersionFromFile(filePath) {
     if !FileExist(filePath) {
         return ""
     }
-    escapedPath := StrReplace(filePath, "'", "''")
-    psCommand := "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo('" escapedPath "'); $v.ProductVersion"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    return Trim(exec.StdOut.ReadAll(), "`r`n`t ")
+    try {
+        return FileGetVersion(filePath)
+    } catch Error as err {
+        return ""
+    }
 }
 
 ShowConfigGui(*) {
@@ -260,50 +384,61 @@ ShowConfigGui(*) {
 
     cfgGui := Gui("+AlwaysOnTop", "VR Audio Config")
     cfgGui.SetFont("s10", "Segoe UI")
-    cfgGui.AddText("w780", "Pick what you want while in VR vs on desktop. Advanced alias tuning is behind 'Advanced...'.")
+    cfgGui.AddText("w1180", "Three profiles: SteamVR/Beyond, active Virtual Desktop session, and desktop. Advanced alias tuning is behind 'Advanced...'.")
     if showOnboarding {
         cfgGui.SetFont("s10 cBlue Bold", "Segoe UI")
-        cfgGui.AddText("w780 y+8", "First run setup: choose your VR/Desktop audio targets now, then click Save.")
+        cfgGui.AddText("w1180 y+8", "First run setup: choose SteamVR / Virtual Desktop / Desktop targets, then click Save.")
         cfgGui.SetFont("s10 cDefault Norm", "Segoe UI")
     }
     if !BROADCAST_VERSION_OK {
         cfgGui.SetFont("s10 cRed Bold", "Segoe UI")
-        cfgGui.AddText("w780 y+8", "NOT ACTIVE: This tool requires NVIDIA Broadcast 1.4.x. If you need 2.1.0+, this technique will not work.")
+        cfgGui.AddText("w1180 y+8", "NOT ACTIVE: This tool requires NVIDIA Broadcast 1.4.x. If you need 2.1.0+, this technique will not work.")
         cfgGui.SetFont("s10 cDefault Norm", "Segoe UI")
     }
-    if IsVirtualDesktopRunning() {
-        cfgGui.SetFont("s10 cRed Bold", "Segoe UI")
-        cfgGui.AddText("w780 y+8", "NOT ACTIVE due to presence of Virtual Desktop which handles audio inputs/outputs in VR.")
+    if IsVirtualDesktopSessionActive() {
+        cfgGui.SetFont("s10 cGreen Bold", "Segoe UI")
+        cfgGui.AddText("w1180 y+8", "Virtual Desktop session is ACTIVE right now - Broadcast will use the Virtual Desktop mic profile.")
         cfgGui.SetFont("s10 cDefault Norm", "Segoe UI")
     }
 
+    colW := 370
+    gap := 20
     leftX := 20
-    rightX := 410
+    midX := leftX + colW + gap
+    rightX := midX + colW + gap
     topY := 44
-    colW := 360
     groupY := topY + 40
     groupH := 210
 
-    cfgGui.SetFont("s18", "Segoe UI Emoji")
-    cfgGui.AddText(Format("x{} y{} w{} Center", leftX, topY, colW), "🥽 Audio in VR")
-    cfgGui.AddText(Format("x{} y{} w{} Center", rightX, topY, colW), "🖥️ Audio on Desktop")
+    cfgGui.SetFont("s16", "Segoe UI Emoji")
+    cfgGui.AddText(Format("x{} y{} w{} Center", leftX, topY, colW), "🥽 SteamVR / Beyond")
+    cfgGui.AddText(Format("x{} y{} w{} Center", midX, topY, colW), "🖥️ Virtual Desktop")
+    cfgGui.AddText(Format("x{} y{} w{} Center", rightX, topY, colW), "🎧 Desktop")
 
     cfgGui.SetFont("s10", "Segoe UI")
     cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", leftX, groupY, colW, groupH), "")
+    cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", midX, groupY, colW, groupH), "")
     cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", rightX, groupY, colW, groupH), "")
 
     cfgGui.AddText(Format("x{} y{} w{}", leftX + 14, groupY + 28, colW - 28), "Input (mic source in NVIDIA Broadcast)")
     vrInputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", leftX + 14, groupY + 50, colW - 28), captureDevices)
-    cfgGui.AddText(Format("x{} y{} w{}", leftX + 14, groupY + 92, colW - 28), "Output (Windows default + comms output)")
+    cfgGui.AddText(Format("x{} y{} w{}", leftX + 14, groupY + 92, colW - 28), "Output (Windows default + comms)")
     vrOutputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", leftX + 14, groupY + 114, colW - 28), renderDevices)
+
+    cfgGui.AddText(Format("x{} y{} w{}", midX + 14, groupY + 28, colW - 28), "Input (mic source in NVIDIA Broadcast)")
+    vdInputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", midX + 14, groupY + 50, colW - 28), captureDevices)
+    cfgGui.AddText(Format("x{} y{} w{}", midX + 14, groupY + 92, colW - 28), "Output (Windows default + comms)")
+    vdOutputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", midX + 14, groupY + 114, colW - 28), renderDevices)
 
     cfgGui.AddText(Format("x{} y{} w{}", rightX + 14, groupY + 28, colW - 28), "Input (mic source in NVIDIA Broadcast)")
     desktopInputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", rightX + 14, groupY + 50, colW - 28), captureDevices)
-    cfgGui.AddText(Format("x{} y{} w{}", rightX + 14, groupY + 92, colW - 28), "Output (Windows default + comms output)")
+    cfgGui.AddText(Format("x{} y{} w{}", rightX + 14, groupY + 92, colW - 28), "Output (Windows default + comms)")
     desktopOutputPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", rightX + 14, groupY + 114, colW - 28), renderDevices)
 
     SetDropDownSelectionByContains(vrInputPick, captureDevices, APP_CONFIG.BroadcastVrMicSource)
     SetDropDownSelectionByAliases(vrOutputPick, renderDevices, APP_CONFIG.VrRenderAliases)
+    SetDropDownSelectionByContains(vdInputPick, captureDevices, APP_CONFIG.BroadcastVdMicSource)
+    SetDropDownSelectionByAliases(vdOutputPick, renderDevices, APP_CONFIG.VdRenderAliases)
     SetDropDownSelectionByContains(desktopInputPick, captureDevices, APP_CONFIG.BroadcastDesktopMicSource)
     SetDropDownSelectionByAliases(desktopOutputPick, renderDevices, APP_CONFIG.DesktopRenderAliases)
 
@@ -312,7 +447,7 @@ ShowConfigGui(*) {
     advancedBtn := cfgGui.AddButton(Format("x{} y{} w140 h32", leftX + 132, buttonY), "Advanced...")
     cancelBtn := cfgGui.AddButton(Format("x{} y{} w120 h32", leftX + 284, buttonY), "Cancel")
 
-    saveBtn.OnEvent("Click", (*) => SaveSimpleConfigFromGui(cfgGui, vrInputPick, vrOutputPick, desktopInputPick, desktopOutputPick))
+    saveBtn.OnEvent("Click", (*) => SaveSimpleConfigFromGui(cfgGui, vrInputPick, vrOutputPick, vdInputPick, vdOutputPick, desktopInputPick, desktopOutputPick))
     advancedBtn.OnEvent("Click", (*) => ShowAdvancedConfigGui())
     cancelBtn.OnEvent("Click", (*) => cfgGui.Destroy())
     cfgGui.Show("AutoSize Center")
@@ -326,28 +461,30 @@ ShowAdvancedConfigGui(*) {
     if (broadcastCaptureDevices.Length = 0) {
         broadcastCaptureDevices := ["NVIDIA Broadcast"]
     }
-    standDown := IsVirtualDesktopRunning()
+    vdActive := IsVirtualDesktopSessionActive()
 
     cfgGui := Gui("+AlwaysOnTop", "VR Audio Config - Advanced")
     cfgGui.SetFont("s10", "Segoe UI")
-    cfgGui.AddText("w780", "Power-user mode. Keep fallback aliases with |. These groups map directly to IN VR and ON DESKTOP behavior.")
+    cfgGui.AddText("w780", "Power-user mode. Keep fallback aliases with |. Profiles: SteamVR, active Virtual Desktop, Desktop.")
     if !BROADCAST_VERSION_OK {
         cfgGui.SetFont("s10 cRed Bold", "Segoe UI")
         cfgGui.AddText("w780 y+8", "NOT ACTIVE: This tool requires NVIDIA Broadcast 1.4.x. If you need 2.1.0+, this technique will not work.")
         cfgGui.SetFont("s10 cDefault Norm", "Segoe UI")
     }
-    if (standDown) {
-        cfgGui.SetFont("s10 cRed Bold", "Segoe UI")
-        cfgGui.AddText("w780 y+8", "NOT ACTIVE due to presence of Virtual Desktop which handles audio inputs/outputs in VR.")
+    if (vdActive) {
+        cfgGui.SetFont("s10 cGreen Bold", "Segoe UI")
+        cfgGui.AddText("w780 y+8", "Virtual Desktop session is ACTIVE - Render endpoint 'Virtual Desktop Audio' is present.")
         cfgGui.SetFont("s10 cDefault Norm", "Segoe UI")
     }
     x := 18, w := 780
-    contentOffset := standDown ? 30 : 0
+    contentOffset := vdActive ? 30 : 0
     sharedY := 58 + contentOffset
     sharedH := 132
     vrY := sharedY + sharedH + 10
     vrH := 184
-    desktopY := vrY + vrH + 10
+    vdY := vrY + vrH + 10
+    vdH := 184
+    desktopY := vdY + vdH + 10
     desktopH := 184
     buttonY := desktopY + desktopH + 12
 
@@ -358,30 +495,41 @@ ShowAdvancedConfigGui(*) {
     capturePick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, sharedY + 96, 580), broadcastCaptureDevices)
     captureUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, sharedY + 96, 166), "Use Picked Broadcast")
 
-    cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", x, vrY, w, vrH), "In VR")
+    cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", x, vrY, w, vrH), "SteamVR / Beyond")
     cfgGui.AddText(Format("x{} y{} w{}", x + 12, vrY + 24, w - 24), "Output aliases:")
     vrRenderEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, vrY + 46, w - 24), JoinAliasList(APP_CONFIG.VrRenderAliases))
     vrRenderPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, vrY + 74, 580), renderDevices)
     vrRenderUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, vrY + 74, 166), "Use Picked Device")
-    cfgGui.AddText(Format("x{} y{} w{}", x + 12, vrY + 108, w - 24), "Input while in VR (will be set in NVIDIA Broadcast for you):")
+    cfgGui.AddText(Format("x{} y{} w{}", x + 12, vrY + 108, w - 24), "Input while in SteamVR (NVIDIA Broadcast mic source):")
     vrMicSourceEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, vrY + 130, w - 24), APP_CONFIG.BroadcastVrMicSource)
     vrMicSourcePick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, vrY + 158, 580), captureDevices)
     vrMicSourceUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, vrY + 158, 166), "Use Picked Device")
+
+    cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", x, vdY, w, vdH), "Virtual Desktop (active session)")
+    cfgGui.AddText(Format("x{} y{} w{}", x + 12, vdY + 24, w - 24), "Output aliases (also used to detect an active VD session when Active):")
+    vdRenderEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, vdY + 46, w - 24), JoinAliasList(APP_CONFIG.VdRenderAliases))
+    vdRenderPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, vdY + 74, 580), renderDevices)
+    vdRenderUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, vdY + 74, 166), "Use Picked Device")
+    cfgGui.AddText(Format("x{} y{} w{}", x + 12, vdY + 108, w - 24), "Input while VD session is active (NVIDIA Broadcast mic source):")
+    vdMicSourceEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, vdY + 130, w - 24), APP_CONFIG.BroadcastVdMicSource)
+    vdMicSourcePick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, vdY + 158, 580), captureDevices)
+    vdMicSourceUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, vdY + 158, 166), "Use Picked Device")
 
     cfgGui.AddGroupBox(Format("x{} y{} w{} h{}", x, desktopY, w, desktopH), "On Desktop")
     cfgGui.AddText(Format("x{} y{} w{}", x + 12, desktopY + 24, w - 24), "Output aliases:")
     desktopRenderEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, desktopY + 46, w - 24), JoinAliasList(APP_CONFIG.DesktopRenderAliases))
     desktopRenderPick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, desktopY + 74, 580), renderDevices)
     desktopRenderUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, desktopY + 74, 166), "Use Picked Device")
-    cfgGui.AddText(Format("x{} y{} w{}", x + 12, desktopY + 108, w - 24), "Input on desktop (will be set in NVIDIA Broadcast for you):")
+    cfgGui.AddText(Format("x{} y{} w{}", x + 12, desktopY + 108, w - 24), "Input on desktop (NVIDIA Broadcast mic source, default Jabra):")
     desktopMicSourceEdit := cfgGui.AddEdit(Format("x{} y{} w{}", x + 12, desktopY + 130, w - 24), APP_CONFIG.BroadcastDesktopMicSource)
     desktopMicSourcePick := cfgGui.AddDropDownList(Format("x{} y{} w{}", x + 12, desktopY + 158, 580), captureDevices)
     desktopMicSourceUseBtn := cfgGui.AddButton(Format("x{} y{} w{}", x + 602, desktopY + 158, 166), "Use Picked Device")
 
-    ; Keep dropdowns aligned with current text values to avoid UI confusion.
     SetDropDownSelectionByAliases(capturePick, broadcastCaptureDevices, APP_CONFIG.CaptureAliases)
     SetDropDownSelectionByAliases(vrRenderPick, renderDevices, APP_CONFIG.VrRenderAliases)
     SetDropDownSelectionByContains(vrMicSourcePick, captureDevices, APP_CONFIG.BroadcastVrMicSource)
+    SetDropDownSelectionByAliases(vdRenderPick, renderDevices, APP_CONFIG.VdRenderAliases)
+    SetDropDownSelectionByContains(vdMicSourcePick, captureDevices, APP_CONFIG.BroadcastVdMicSource)
     SetDropDownSelectionByAliases(desktopRenderPick, renderDevices, APP_CONFIG.DesktopRenderAliases)
     SetDropDownSelectionByContains(desktopMicSourcePick, captureDevices, APP_CONFIG.BroadcastDesktopMicSource)
 
@@ -390,10 +538,12 @@ ShowAdvancedConfigGui(*) {
 
     captureUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(captureEdit, capturePick))
     vrRenderUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(vrRenderEdit, vrRenderPick))
+    vdRenderUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(vdRenderEdit, vdRenderPick))
     desktopRenderUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(desktopRenderEdit, desktopRenderPick))
     vrMicSourceUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(vrMicSourceEdit, vrMicSourcePick))
+    vdMicSourceUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(vdMicSourceEdit, vdMicSourcePick))
     desktopMicSourceUseBtn.OnEvent("Click", (*) => ApplyDropdownSelection(desktopMicSourceEdit, desktopMicSourcePick))
-    saveBtn.OnEvent("Click", (*) => SaveConfigFromGui(cfgGui, captureEdit, vrRenderEdit, desktopRenderEdit, vrMicSourceEdit, desktopMicSourceEdit))
+    saveBtn.OnEvent("Click", (*) => SaveConfigFromGui(cfgGui, captureEdit, vrRenderEdit, vdRenderEdit, desktopRenderEdit, vrMicSourceEdit, vdMicSourceEdit, desktopMicSourceEdit))
     cancelBtn.OnEvent("Click", (*) => cfgGui.Destroy())
     cfgGui.Show("AutoSize Center")
 }
@@ -406,14 +556,6 @@ FilterDeviceList(items, containsText) {
         }
     }
     return filtered
-}
-
-NormalizeDeviceLabel(name) {
-    trimmed := Trim(name)
-    if (trimmed = "") {
-        return trimmed
-    }
-    return RegExReplace(trimmed, "^\d+\s*-\s*")
 }
 
 SetDropDownSelectionByContains(dropdown, items, needle) {
@@ -440,20 +582,24 @@ SetDropDownSelectionByAliases(dropdown, items, aliases) {
     }
 }
 
-SaveSimpleConfigFromGui(cfgGui, vrInputPick, vrOutputPick, desktopInputPick, desktopOutputPick) {
+SaveSimpleConfigFromGui(cfgGui, vrInputPick, vrOutputPick, vdInputPick, vdOutputPick, desktopInputPick, desktopOutputPick) {
     global APP_CONFIG
     vrInput := NormalizeDeviceLabel(vrInputPick.Text)
     vrOutput := NormalizeDeviceLabel(vrOutputPick.Text)
+    vdInput := NormalizeDeviceLabel(vdInputPick.Text)
+    vdOutput := NormalizeDeviceLabel(vdOutputPick.Text)
     desktopInput := NormalizeDeviceLabel(desktopInputPick.Text)
     desktopOutput := NormalizeDeviceLabel(desktopOutputPick.Text)
 
-    if (vrInput = "" || vrOutput = "" || desktopInput = "" || desktopOutput = "") {
-        MsgBox "Please select all four devices before saving."
+    if (vrInput = "" || vrOutput = "" || vdInput = "" || vdOutput = "" || desktopInput = "" || desktopOutput = "") {
+        MsgBox "Please select all six devices before saving."
         return
     }
 
     APP_CONFIG.BroadcastVrMicSource := vrInput
     APP_CONFIG.VrRenderAliases := [vrOutput]
+    APP_CONFIG.BroadcastVdMicSource := vdInput
+    APP_CONFIG.VdRenderAliases := [vdOutput]
     APP_CONFIG.BroadcastDesktopMicSource := desktopInput
     APP_CONFIG.DesktopRenderAliases := [desktopOutput]
 
@@ -469,38 +615,57 @@ ApplyDropdownSelection(targetEdit, sourceDropdown) {
     }
 }
 
-SaveConfigFromGui(cfgGui, captureEdit, vrRenderEdit, desktopRenderEdit, vrMicSourceEdit, desktopMicSourceEdit) {
+SaveConfigFromGui(cfgGui, captureEdit, vrRenderEdit, vdRenderEdit, desktopRenderEdit, vrMicSourceEdit, vdMicSourceEdit, desktopMicSourceEdit) {
     global APP_CONFIG
     APP_CONFIG.CaptureAliases := ParseAliasList(captureEdit.Value)
     APP_CONFIG.VrRenderAliases := ParseAliasList(vrRenderEdit.Value)
+    APP_CONFIG.VdRenderAliases := ParseAliasList(vdRenderEdit.Value)
     APP_CONFIG.DesktopRenderAliases := ParseAliasList(desktopRenderEdit.Value)
     APP_CONFIG.BroadcastVrMicSource := Trim(vrMicSourceEdit.Value)
+    APP_CONFIG.BroadcastVdMicSource := Trim(vdMicSourceEdit.Value)
     APP_CONFIG.BroadcastDesktopMicSource := Trim(desktopMicSourceEdit.Value)
     SaveConfig(APP_CONFIG)
     cfgGui.Destroy()
     MsgBox "Saved config to:`n" CONFIG_FILE
 }
 
-ResolveAudioDeviceName(partialName) {
-    escaped := StrReplace(partialName, "'", "''")
-    psCommand := "$term = '" escaped "'; " .
-        "(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render' -ErrorAction SilentlyContinue | " .
-        "ForEach-Object { " .
-        "$props = Get-ItemProperty -Path ($_.PSPath + '\Properties') -ErrorAction SilentlyContinue; " .
-        "$name = $props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},14'; " .
-        "if (-not $name) { $name = $props.'{b3f8fa53-0004-438e-9003-51a46e139bfc},6' }; " .
-        "if (-not $name) { $name = $props.'{a45c254e-df1c-4efd-8020-67d146a850e0},2' }; " .
-        "$name " .
-        "}) | Where-Object { $_ -and $_ -like ('*' + $term + '*') } | Sort-Object -Unique | Select-Object -First 1"
-    shell := ComObject("WScript.Shell")
-    exec := shell.Exec(Format('{} /c powershell -NoProfile -Command "{}"', A_ComSpec, psCommand))
-    deviceName := Trim(exec.StdOut.ReadAll(), "`r`n`t ")
-    return deviceName
+ResolveAudioDeviceName(partialName, direction := "Render") {
+    if !RefreshSvvCache() {
+        return ""
+    }
+    global SVV_CACHE_TEXT
+    term := NormalizeDeviceLabel(partialName)
+    if (term = "") {
+        return ""
+    }
+    for _, line in StrSplit(SVV_CACHE_TEXT, "`n", "`r") {
+        if (line = "") {
+            continue
+        }
+        cols := StrSplit(line, "`t")
+        if (cols.Length < 6) {
+            continue
+        }
+        itemName := cols[1]
+        deviceName := cols[2]
+        deviceId := cols[3]
+        itemDirection := cols[4]
+        itemType := cols[5]
+        if (itemType != "Device" || itemDirection != direction) {
+            continue
+        }
+        hay := NormalizeDeviceLabel(itemName) " " NormalizeDeviceLabel(deviceName) " " NormalizeDeviceLabel(deviceId)
+        if InStr(hay, term) {
+            label := NormalizeDeviceLabel(deviceName)
+            return (label != "") ? label : NormalizeDeviceLabel(itemName)
+        }
+    }
+    return ""
 }
 
-ResolveAudioDeviceNameFromAliases(aliases) {
+ResolveAudioDeviceNameFromAliases(aliases, direction := "Render") {
     for _, alias in aliases {
-        name := ResolveAudioDeviceName(alias)
+        name := ResolveAudioDeviceName(alias, direction)
         if (name != "") {
             return name
         }
@@ -530,7 +695,7 @@ SetDefaultAudioDeviceBySoundVolumeView(deviceId, setAsComms := false) {
 SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch := false, direction := "Render") {
     svvPath := A_ScriptDir "\SoundVolumeView.exe"
     nircmdPath := A_ScriptDir "\nircmd.exe"
-    
+
     if !FileExist(svvPath) && !FileExist(nircmdPath) {
         MsgBox "No supported audio tool found. Expected SoundVolumeView.exe or nircmd.exe in: " A_ScriptDir
         return
@@ -548,7 +713,7 @@ SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch 
             }
         }
         if (isArray) {
-            resolvedName := ResolveAudioDeviceNameFromAliases(deviceNameOrPartial)
+            resolvedName := ResolveAudioDeviceNameFromAliases(deviceNameOrPartial, direction)
             missingName := ""
             for index, alias in deviceNameOrPartial {
                 if (index > 1) {
@@ -557,11 +722,11 @@ SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch 
                 missingName .= alias
             }
         } else {
-            resolvedName := ResolveAudioDeviceName(deviceNameOrPartial)
+            resolvedName := ResolveAudioDeviceName(deviceNameOrPartial, direction)
             missingName := deviceNameOrPartial
         }
         if (deviceId = "" && resolvedName = "") {
-            MsgBox 'No audio output device found matching "' missingName '".'
+            ; Soft-fail for mode switches (device may be unplugged / session ended).
             return
         }
         deviceName := resolvedName
@@ -572,129 +737,82 @@ SetDefaultAudioDevice(deviceNameOrPartial, setAsComms := false, usePartialMatch 
             return
         }
     }
-    
+
     try {
-        ; Set as default playback device
         if !FileExist(nircmdPath) {
-            MsgBox "NirCmd not found at: " nircmdPath
             return
         }
         RunWait(Format('"{}" setdefaultsounddevice "{}" 1', nircmdPath, deviceName),, "Hide")
-        Sleep(500)  ; Give Windows time to process the change
-        
-        ; Set as default communications device if requested
+        Sleep(500)
+
         if (setAsComms) {
             RunWait(Format('"{}" setdefaultsounddevice "{}" 1 2', nircmdPath, deviceName),, "Hide")
-            Sleep(500)  ; Give Windows time to process the change
+            Sleep(500)
         }
     } catch Error as err {
-        ; If there's an error, just continue - we don't want to interrupt the VR shutdown
     }
 }
 
-SetTitleMatchMode(2)
-DetectHiddenWindows(true)
-
-; Monitor the vrmonitor.exe process
-OnProcessStartStop("vrmonitor.exe", SteamVRStarted, SteamVRStopped)
-
-SteamVRStarted() {
-    global APP_CONFIG, IS_STANDDOWN, BROADCAST_VERSION_OK
-    if !BROADCAST_VERSION_OK {
-        return
+SetBroadcastMicSource(partialText) {
+    if (Trim(partialText) = "") {
+        return false
     }
-    UpdateStandDownState()
-    if IS_STANDDOWN {
-        return
+    if !WinExist("ahk_class RTXVoiceWindowClass") {
+        return false
     }
-    ; Keep system default input/comms input on NVIDIA Broadcast while entering VR
-    SetDefaultAudioDevice(APP_CONFIG.CaptureAliases, true, true, "Capture")
+    WinActivate("ahk_class RTXVoiceWindowClass")
+    ControlClick("Button4", "ahk_class RTXVoiceWindowClass") ; Microphone tab
     Sleep(500)
-
-    ; Set Windows default audio devices for VR first
-    SetDefaultAudioDevice(APP_CONFIG.VrRenderAliases, true, true)  ; Match likely aliases across naming quirks
-    Sleep(1000)  ; Give Windows time to process the audio change
-    
-    ; RestartNvidiaBroadcast()
-    ; SteamVR started, select "YondBe" microphone and speaker
-    if WinExist("ahk_class RTXVoiceWindowClass")
-    {
-        WinActivate("ahk_class RTXVoiceWindowClass")
-
-        ; Set the microphone input to configured VR source text
-        ControlClick("Button4", "ahk_class RTXVoiceWindowClass")  ; Microphone tab
-        Sleep(500)
-        ControlFocus("ComboBox6", "ahk_class RTXVoiceWindowClass")
-        ControlClick("ComboBox6", "ahk_class RTXVoiceWindowClass")
-        Sleep(150)
-        SelectComboItemContains("ComboBox6", "ahk_class RTXVoiceWindowClass", APP_CONFIG.BroadcastVrMicSource)
-
-        ; Close the NVIDIA Broadcast window (but don't kill the app)
-        CloseNvidiaBroadcastWindow()
-    }
+    ControlFocus("ComboBox6", "ahk_class RTXVoiceWindowClass")
+    ControlClick("ComboBox6", "ahk_class RTXVoiceWindowClass")
+    Sleep(150)
+    ok := SelectComboItemContains("ComboBox6", "ahk_class RTXVoiceWindowClass", partialText)
+    CloseNvidiaBroadcastWindow()
+    return ok
 }
 
-SteamVRStopped() {
-    global APP_CONFIG, IS_STANDDOWN, BROADCAST_VERSION_OK
+ApplyAudioProfile(mode) {
+    global APP_CONFIG, BROADCAST_VERSION_OK
     if !BROADCAST_VERSION_OK {
         return
     }
-    UpdateStandDownState()
-    if IS_STANDDOWN {
-        return
-    }
-    ; Wait a bit for VR components to finish shutting down
-    Sleep(2000)
-    
-    ; RestartNvidiaBroadcast()
-    ; Keep system default input/comms input on NVIDIA Broadcast while leaving VR
+
+    ; Keep Windows default capture on NVIDIA Broadcast in every mode.
     SetDefaultAudioDevice(APP_CONFIG.CaptureAliases, true, true, "Capture")
     Sleep(500)
 
-    ; SteamVR stopped, select NVIDIA Broadcast source back to USB audio CODEC
-    if WinExist("ahk_class RTXVoiceWindowClass")
-    {
-        WinActivate("ahk_class RTXVoiceWindowClass")
-
-        ; Set the microphone input to configured desktop source text
-        ControlClick("Button4", "ahk_class RTXVoiceWindowClass")  ; Microphone tab
-        Sleep(500)
-        ControlFocus("ComboBox6", "ahk_class RTXVoiceWindowClass")
-        ControlClick("ComboBox6", "ahk_class RTXVoiceWindowClass")
-        Sleep(150)
-        SelectComboItemContains("ComboBox6", "ahk_class RTXVoiceWindowClass", APP_CONFIG.BroadcastDesktopMicSource)
-
-        ; Close the NVIDIA Broadcast window (but don't kill the app)
-        CloseNvidiaBroadcastWindow()
+    if (mode = "virtualdesktop") {
+        SetDefaultAudioDevice(APP_CONFIG.VdRenderAliases, true, true, "Render")
+        Sleep(1000)
+        SetBroadcastMicSource(APP_CONFIG.BroadcastVdMicSource)
+        return
     }
 
-    ; Wait a bit after NVIDIA Broadcast changes before changing Windows audio
+    if (mode = "steamvr") {
+        SetDefaultAudioDevice(APP_CONFIG.VrRenderAliases, true, true, "Render")
+        Sleep(1000)
+        SetBroadcastMicSource(APP_CONFIG.BroadcastVrMicSource)
+        return
+    }
+
+    ; Desktop / default
+    SetBroadcastMicSource(APP_CONFIG.BroadcastDesktopMicSource)
     Sleep(1000)
-    
-    ; Set Windows default audio devices for desktop
-    SetDefaultAudioDevice(APP_CONFIG.DesktopRenderAliases, true, true)  ; Set as both playback and comms device
+    SetDefaultAudioDevice(APP_CONFIG.DesktopRenderAliases, true, true, "Render")
 }
 
 RestartNvidiaBroadcast() {
     ; Disabled by request: do not kill/restart NVIDIA Broadcast automatically.
-    ;if ProcessExist("NVIDIA Broadcast UI.exe") {
-    ;    ProcessClose("NVIDIA Broadcast UI.exe")
-    ;    Sleep(3000)
-    ;}
-    ;Run("C:\\Program Files\\NVIDIA Corporation\\NVIDIA Broadcast\\NVIDIA Broadcast UI.exe")
-    ;Sleep(5000)
 }
 
 CloseNvidiaBroadcastWindow() {
-    ; Ensure the window is active before trying to close it
     if WinExist("ahk_class RTXVoiceWindowClass") {
         WinActivate("ahk_class RTXVoiceWindowClass")
         Sleep(500)
-        WinClose("ahk_class RTXVoiceWindowClass")  ; Attempt to close the window
-        Sleep(1000)  ; Wait and retry if necessary
-        if WinExist("ahk_class RTXVoiceWindowClass")  ; Check if it's still open
-        {
-            WinClose("ahk_class RTXVoiceWindowClass")  ; Try again
+        WinClose("ahk_class RTXVoiceWindowClass")
+        Sleep(1000)
+        if WinExist("ahk_class RTXVoiceWindowClass") {
+            WinClose("ahk_class RTXVoiceWindowClass")
         }
     }
 }
@@ -713,42 +831,27 @@ SelectComboItemContains(controlName, windowTitle, partialText) {
     return false
 }
 
-OnProcessStartStop(ProcessName, OnStartFunc, OnStopFunc) {
-    static isProcessRunning := false
-    static wasStandDown := false
-    global IS_STANDDOWN
+SetTitleMatchMode(2)
+DetectHiddenWindows(true)
+
+; Poll for active Virtual Desktop session and/or SteamVR; apply the matching audio profile.
+MonitorAudioModes() {
+    static lastMode := ""
     Loop {
-        UpdateStandDownState()
-        currentStandDown := IS_STANDDOWN
-        processNow := ProcessExist(ProcessName)
-
-        if (currentStandDown) {
-            isProcessRunning := !!processNow
-            wasStandDown := true
-            Sleep(1000)
-            continue
-        }
-
-        if (wasStandDown && processNow) {
-            isProcessRunning := true
-            OnStartFunc()
-            wasStandDown := false
-            Sleep(1000)
-            continue
-        }
-        wasStandDown := false
-
-        if processNow {
-            if !isProcessRunning {
-                isProcessRunning := true
-                OnStartFunc()  ; Call start function directly
+        mode := DetectAudioMode()
+        if (mode != lastMode) {
+            ; Brief settle when leaving VR so devices finish disconnecting.
+            if (lastMode = "steamvr" || lastMode = "virtualdesktop") {
+                Sleep(1500)
+                mode := DetectAudioMode()
             }
-        } else {
-            if isProcessRunning {
-                isProcessRunning := false
-                OnStopFunc()  ; Call stop function directly
-            }
+            ApplyAudioProfile(mode)
+            UpdateTrayForMode(mode, true)
+            lastMode := mode
         }
-        Sleep(1000)
+        ; Registry-only detect on this interval - never launch helpers here.
+        Sleep(3000)
     }
 }
+
+MonitorAudioModes()
