@@ -9,3 +9,7 @@ HANDOFF.md
 autoswitch mic for VR.exe
 .specstory/*
 .cursorindexingignore
+SoundVolumeView.exe
+nircmd.exe
+nircmdc.exe
+_detect_test.ahk

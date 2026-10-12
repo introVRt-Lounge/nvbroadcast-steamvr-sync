@@ -7,7 +7,14 @@ $sourceExe = Join-Path $repoRoot "autoswitch mic for VR.exe"
 $iconPath = Join-Path $repoRoot "images\beyond_nvidia.ico"
 $compiler = "C:\Program Files\AutoHotkey\Compiler\Ahk2Exe.exe"
 $baseFile = "C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
-$runtimeDir = "C:\Users\HeavyGee\Documents\AutoHotkey"
+$runtimeDirCandidates = @(
+    "H:\Users\HeavyGee\Documents\AutoHotkey",
+    "C:\Users\HeavyGee\Documents\AutoHotkey"
+)
+$runtimeDir = $runtimeDirCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $runtimeDir) {
+    throw "Runtime directory missing. Tried: $($runtimeDirCandidates -join ', ')"
+}
 $runtimeExe = Join-Path $runtimeDir "autoswitch mic for VR.exe"
 
 if (-not (Test-Path $compiler)) {
@@ -18,9 +25,6 @@ if (-not (Test-Path $sourceAhk)) {
 }
 if (-not (Test-Path $iconPath)) {
     throw "Icon file missing at '$iconPath'."
-}
-if (-not (Test-Path $runtimeDir)) {
-    throw "Runtime directory missing at '$runtimeDir'."
 }
 if (-not (Test-Path $baseFile)) {
     throw "AutoHotkey v2 base executable missing at '$baseFile'."
@@ -66,7 +70,7 @@ if ($ahkProcs) {
 Write-Host "Copying EXE to runtime directory..."
 Copy-Item $sourceExe $runtimeExe -Force
 
-Write-Host "Launching runtime EXE from C: path..."
+Write-Host "Launching runtime EXE from '$runtimeDir'..."
 Start-Process -FilePath $runtimeExe -WorkingDirectory $runtimeDir
 
 Write-Host "Done."
